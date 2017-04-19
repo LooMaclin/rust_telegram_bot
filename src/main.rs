@@ -6,7 +6,7 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 
-use telegram_bot::*;
+use telegram_bot::{Api, MessageType, ListeningMethod, ListeningAction};
 use std::io::Read;
 use hyper::client::Client;
 use hyper::net::HttpsConnector;
