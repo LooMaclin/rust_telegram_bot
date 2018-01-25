@@ -1,16 +1,23 @@
+#![feature(proc_macro, conservative_impl_trait, generators)]
+
+extern crate futures as original_futures;
 extern crate telegram_bot;
-extern crate hyper;
-extern crate hyper_rustls;
-extern crate serde_json;
+extern crate tokio_core;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
+extern crate hyper;
+extern crate futures_await as futures;
 
-use telegram_bot::{Api, MessageType, ListeningMethod, ListeningAction};
-use std::io::Read;
-use hyper::client::Client;
-use hyper::net::HttpsConnector;
-
+use std::env;
+use tokio_core::reactor::Core;
+use telegram_bot::{Api, UpdateKind, MessageKind, CanReplySendMessage, Update, Error};
+use futures::{Stream};
+use hyper::client::{Client, HttpConnector};
+use hyper::Uri;
+use std::sync::Arc;
+use futures::prelude::*;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
@@ -30,69 +37,56 @@ pub struct PlaygroundRequest {
     backtrace: String
 }
 
-fn main() {
-    // Create bot, test simple API call and print bot information
-    let api = Api::from_env("TOKEN").unwrap();
-    println!("getMe: {:?}", api.get_me());
-    let mut listener = api.listener(ListeningMethod::LongPoll(None));
+#[async]
+fn send_request(client: Arc<Client<HttpConnector>>) -> Result<String, ()> {
+    let response = await!(client.get("https://hyper.rs".parse::<Uri>().unwrap()));
+    let response = response.unwrap();
+    let mut body = await!(response.body().concat2());
+    let mut body = body.unwrap();
+    let result : ResponseType = serde_json::from_slice(&body)
+        .unwrap_or(ResponseType::ProgramCompileError {
+            rustc: String::from("Ответ на запрос не удалось десериализовать")
+        });
+    let mut result = match result {
+        ResponseType::ProgramCompiled { program, .. } => {
+            format!("Программа скомпилированна успешно: {}", program)
+        },
+        ResponseType::ProgramCompileError { rustc, ..} => {
+            format!("Ошибка компиляции программы: {}", rustc)
+        }
+    };
+    if result.len() > 500 {
+        result.truncate(500);
+    }
+    Ok(result)
+}
 
-    let res = listener.listen(|u| {
-
-        if let Some(m) = u.message {
-            let name = m.from.first_name;
-            match m.msg {
-                MessageType::Text(t) => {
-                    println!("<{}> {}", name, t);
-
-                    if t.starts_with("/rust ") {
-                        let program = t.split("/rust ").collect();
-                        let mut result = String::new();
-                        let tls = hyper_rustls::TlsClient::new();
-                        let connector = HttpsConnector::new(tls);
-                        let client = Client::with_connector(connector);
-                        let playground_request = serde_json::to_string(&PlaygroundRequest {
-                            code: program,
-                            version: String::from("stable"),
-                            optimize: String::from("0"),
-                            test: false,
-                            separate_output: true,
-                            color: false,
-                            backtrace: String::from("0"),
-                        }).unwrap();
-                        let mut response = client.post("https://play.rust-lang.org/evaluate.json")
-                            .body(&playground_request)
-                            .send()
-                            .unwrap();
-                        response.read_to_string(&mut result);
-                        println!("Result : {:?}", result);
-                        let result : ResponseType = serde_json::from_str(&result)
-                            .unwrap_or(ResponseType::ProgramCompileError {
-                                rustc: String::from("Ответ на запрос не удалось десериализовать")
-                            });
-                        let mut result = match result {
-                            ResponseType::ProgramCompiled { program, .. } => {
-                                format!("Программа скомпилированна успешно: {}", program)
-                            },
-                            ResponseType::ProgramCompileError { rustc, ..} => {
-                                format!("Ошибка компиляции программы: {}", rustc)
-                            }
-                        };
-                        if result.len() > 500 {
-                            result.truncate(500);
-                        }
-                        try!(api.send_message(
-                            m.chat.id(),
-                            result,
-                            None, None, Some(m.message_id), None));
-                    }
-                },
-                _ => {}
+#[async]
+fn update_stream(api: Arc<Api>, client: Arc<Client<HttpConnector>>) -> Result<(), Error> {
+    let stream = api.stream();
+    #[async]
+    for update in stream {
+        if let UpdateKind::Message(message) = update.kind {
+            if let MessageKind::Text { ref data, .. } = message.kind {
+                println!("<{}>: {}", &message.from.first_name, data);
+                if data.starts_with("/rust ") {
+                    let response = await!(send_request(client.clone()));
+                    api.spawn(message.text_reply(
+                        format!("Hi, {}! You just wrote '{}'", &message.from.first_name, data)
+                    ));
+                }
             }
         }
-        Ok(ListeningAction::Continue)
-    });
-
-    if let Err(e) = res {
-        println!("An error occured: {}", e);
     }
+    Ok(())
+}
+
+
+fn main() {
+    let mut core = Core::new().unwrap();
+    let token = env::var("TELEGRAM_BOT_TOKEN").unwrap();
+    let api = Arc::new(Api::configure(token).build(core.handle()).unwrap());
+    let client = Arc::new(Client::new(&core.handle()));
+    let future = update_stream(api.clone(), client.clone());
+    core.run(future).unwrap();
 }
